@@ -51,7 +51,7 @@ const Container = struct {
     ui: UI,
 };
 
-test "initializes fields in declaration order and injects prior dependencies" {
+test "initializes dependencies before consumers" {
     resetLifecycleLog();
 
     const container = try zdi.init(testing.allocator, Container, .{});
@@ -64,7 +64,7 @@ test "initializes fields in declaration order and injects prior dependencies" {
     try testing.expectEqualSlices(u8, &.{ 1, 2 }, lifecycle_log[0..lifecycle_log_len]);
 }
 
-test "deinitializes fields in reverse declaration order" {
+test "deinitializes fields in reverse dependency order" {
     resetLifecycleLog();
 
     const container = try zdi.init(testing.allocator, Container, .{});
@@ -288,4 +288,34 @@ test "field defaults take precedence over matching externals" {
     defer zdi.deinit(testing.allocator, container);
 
     try testing.expectEqual(@as(u8, 7), container.service.value);
+}
+
+const ReorderedContainer = struct {
+    ui: UI,
+    renderer: Renderer,
+    settings: Settings,
+
+    pub fn observeInit(_: *ReorderedContainer, comptime field_name: []const u8) void {
+        observed_fields[observed_field_count] = field_name;
+        observed_field_count += 1;
+    }
+};
+
+test "derives initialization and cleanup order from dependencies" {
+    resetLifecycleLog();
+    observed_field_count = 0;
+
+    const container = try zdi.init(testing.allocator, ReorderedContainer, .{
+        .observer = ReorderedContainer.observeInit,
+    });
+
+    try testing.expect(container.renderer.settings == &container.settings);
+    try testing.expect(container.ui.renderer == &container.renderer);
+    try testing.expectEqualSlices(u8, &.{ 1, 2 }, lifecycle_log[0..lifecycle_log_len]);
+    try testing.expectEqualStrings("settings", observed_fields[0]);
+    try testing.expectEqualStrings("renderer", observed_fields[1]);
+    try testing.expectEqualStrings("ui", observed_fields[2]);
+
+    zdi.deinit(testing.allocator, container);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, lifecycle_log[0..lifecycle_log_len]);
 }

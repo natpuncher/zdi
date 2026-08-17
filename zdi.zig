@@ -9,15 +9,18 @@ pub fn init(
     validateContainerType(container_type);
     validateConfig(container_type, config);
 
+    const fields = @typeInfo(container_type).@"struct".fields;
+    validateContainerFields(fields);
+    const init_order = comptime initializationOrder(container_type);
+
     const container = try allocator.create(container_type);
     errdefer allocator.destroy(container);
 
     var initialized_count: usize = 0;
-    errdefer internalDeinit(container, initialized_count);
+    errdefer internalDeinit(container, init_order, initialized_count);
 
-    const fields = @typeInfo(container_type).@"struct".fields;
-    validateContainerFields(fields);
-    inline for (fields, 0..) |field, field_index| {
+    inline for (init_order, 0..) |field_index, init_index| {
+        const field = fields[field_index];
         if (field.type == std.mem.Allocator) {
             @compileError(
                 "zdi container field '" ++ field.name ++
@@ -32,7 +35,6 @@ pub fn init(
                 container,
                 allocator,
                 fields,
-                field_index,
                 field.name,
                 config,
             );
@@ -47,12 +49,11 @@ pub fn init(
                 container,
                 allocator,
                 fields,
-                field_index,
                 config,
             );
         }
 
-        initialized_count = field_index + 1;
+        initialized_count = init_index + 1;
         observeInit(config, container, field.name);
     }
 
@@ -60,8 +61,9 @@ pub fn init(
 }
 
 pub fn deinit(allocator: std.mem.Allocator, container: anytype) void {
-    const fields = @typeInfo(@TypeOf(container.*)).@"struct".fields;
-    internalDeinit(container, fields.len);
+    const container_type = @TypeOf(container.*);
+    const init_order = comptime initializationOrder(container_type);
+    internalDeinit(container, init_order, init_order.len);
     allocator.destroy(container);
 }
 
@@ -70,7 +72,6 @@ fn createInstance(
     container: anytype,
     allocator: std.mem.Allocator,
     comptime container_fields: anytype,
-    comptime container_field_index: usize,
     config: anytype,
 ) container_field.type {
     const component_type = container_field.type;
@@ -100,7 +101,6 @@ fn createInstance(
                 field.type,
                 allocator,
                 container_fields,
-                container_field_index,
                 consumer_name,
                 config,
             );
@@ -123,7 +123,6 @@ fn createArgs(
     container: anytype,
     allocator: std.mem.Allocator,
     comptime container_fields: anytype,
-    comptime consumer_index: usize,
     comptime consumer_name: []const u8,
     config: anytype,
 ) args_type {
@@ -138,7 +137,6 @@ fn createArgs(
                     field.type,
                     allocator,
                     container_fields,
-                    consumer_index,
                     consumer_name,
                     config,
                 );
@@ -155,7 +153,6 @@ fn resolve(
     comptime dependency_type: type,
     allocator: std.mem.Allocator,
     comptime container_fields: anytype,
-    comptime consumer_index: usize,
     comptime consumer_name: []const u8,
     config: anytype,
 ) dependency_type {
@@ -198,7 +195,7 @@ fn resolve(
         const pointee_type = dependency_info.pointer.child;
         comptime var match_index: ?usize = null;
 
-        inline for (container_fields[0..consumer_index], 0..) |field, field_index| {
+        inline for (container_fields, 0..) |field, field_index| {
             if (field.type == pointee_type) {
                 if (match_index != null) {
                     @compileError(
@@ -218,9 +215,83 @@ fn resolve(
 
     @compileError(
         "zdi can't resolve dependency '" ++ @typeName(dependency_type) ++
-            "' for field '" ++ consumer_name ++
-            "'; dependencies must appear earlier in the container",
+            "' for field '" ++ consumer_name ++ "'",
     );
+}
+
+fn initializationOrder(
+    comptime container_type: type,
+) [@typeInfo(container_type).@"struct".fields.len]usize {
+    const fields = @typeInfo(container_type).@"struct".fields;
+    var order: [fields.len]usize = undefined;
+    var initialized: [fields.len]bool = .{false} ** fields.len;
+
+    for (0..fields.len) |init_index| {
+        var selected: ?usize = null;
+        for (fields, 0..) |field, field_index| {
+            if (!initialized[field_index] and dependenciesReady(field, fields, initialized)) {
+                selected = field_index;
+                break;
+            }
+        }
+
+        const field_index = selected orelse dependencyCycle(fields, initialized);
+        order[init_index] = field_index;
+        initialized[field_index] = true;
+    }
+
+    return order;
+}
+
+fn dependenciesReady(comptime component: anytype, comptime fields: anytype, initialized: anytype) bool {
+    if (component.default_value_ptr != null or component.type == void) return true;
+
+    if (hasDecl(component.type, "init")) {
+        validateInit(component.type, component.name);
+        const function = @typeInfo(@TypeOf(@field(component.type, "init"))).@"fn";
+        for (function.params) |parameter| {
+            const dependency_type = parameter.type orelse return false;
+            if (containerDependencyIndex(fields, dependency_type)) |dependency_index| {
+                if (!initialized[dependency_index]) return false;
+            }
+        }
+        return true;
+    }
+
+    const component_info = @typeInfo(component.type);
+    if (component_info != .@"struct") return true;
+    for (component_info.@"struct".fields) |field| {
+        if (field.default_value_ptr != null) continue;
+        if (containerDependencyIndex(fields, field.type)) |dependency_index| {
+            if (!initialized[dependency_index]) return false;
+        }
+    }
+    return true;
+}
+
+fn containerDependencyIndex(comptime fields: anytype, comptime dependency_type: type) ?usize {
+    if (dependency_type == std.mem.Allocator) return null;
+
+    const dependency_info = @typeInfo(dependency_type);
+    if (dependency_info != .pointer or dependency_info.pointer.size != .one) return null;
+
+    for (fields, 0..) |field, field_index| {
+        if (field.type == dependency_info.pointer.child) return field_index;
+    }
+    return null;
+}
+
+fn dependencyCycle(comptime fields: anytype, initialized: anytype) noreturn {
+    comptime var message: []const u8 = "zdi dependency cycle between fields";
+    comptime var first = true;
+    for (fields, 0..) |field, field_index| {
+        if (!initialized[field_index]) {
+            message = message ++ if (first) " '" else ", '";
+            message = message ++ field.name ++ "'";
+            first = false;
+        }
+    }
+    @compileError(message);
 }
 
 fn observeInit(config: anytype, container: anytype, comptime field_name: []const u8) void {
@@ -229,14 +300,15 @@ fn observeInit(config: anytype, container: anytype, comptime field_name: []const
     }
 }
 
-fn internalDeinit(container: anytype, initialized_count: usize) void {
+fn internalDeinit(container: anytype, comptime init_order: anytype, initialized_count: usize) void {
     const fields = @typeInfo(@TypeOf(container.*)).@"struct".fields;
 
-    inline for (fields, 0..) |_, reverse_offset| {
-        const field_index = fields.len - 1 - reverse_offset;
+    inline for (init_order, 0..) |_, reverse_offset| {
+        const init_index = init_order.len - 1 - reverse_offset;
+        const field_index = init_order[init_index];
         const field = fields[field_index];
 
-        if (initialized_count > field_index and comptime hasDecl(field.type, "deinit")) {
+        if (initialized_count > init_index and comptime hasDecl(field.type, "deinit")) {
             @call(.auto, @field(field.type, "deinit"), .{&@field(container, field.name)});
         }
     }

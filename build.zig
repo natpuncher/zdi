@@ -92,6 +92,12 @@ pub fn build(build_settings: *std.Build) void {
         "test/compile_errors/missing_auto_dependency.zig",
         "zdi can't resolve dependency '*missing_auto_dependency.Missing' for field 'consumer.missing'",
     );
+    addCompileErrorTest(
+        build_settings,
+        test_step,
+        "test/compile_errors/dependency_cycle.zig",
+        "zdi dependency cycle between fields 'first', 'second'",
+    );
 }
 
 fn addCompileErrorTest(

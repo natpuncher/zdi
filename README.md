@@ -1,8 +1,8 @@
 # zdi
 
-Small compile-time dependency injection container for Zig. Container fields are
-initialized in declaration order. Types may provide `init` or let zdi assemble
-their fields at compile time.
+Small compile-time dependency injection container for Zig. zdi derives
+initialization order from dependencies at compile time. Types may provide
+`init` or let zdi assemble their fields automatically.
 
 ## Example
 
@@ -65,12 +65,12 @@ const Game = struct {
     running: bool = true,
 };
 
-// Dependencies appear before consumers.
+// Declaration order is arbitrary; zdi derives Logger -> Assets -> Audio -> Game.
 const Container = struct {
+    game: Game,
+    audio: Audio,
     logger: Logger,
     assets: Assets,
-    audio: Audio,
-    game: Game,
 
     // Called after every successfully initialized container field.
     pub fn observeInit(
@@ -106,14 +106,14 @@ pub fn main() !void {
 ```
 
 If a later initializer fails, zdi cleans up already initialized components in
-reverse declaration order.
+reverse dependency order.
 
 ## Compile-time contract
 
 - Config accepts optional `externals` and `observer` fields.
 - Externals are resolved by exact type before container dependencies.
-- Container dependencies use single-item pointers and refer to earlier fields.
+- Container dependencies use single-item pointers.
 - A component `init` returns its own type or an error union containing it.
 - Without `init`, required fields are injected and defaults are preserved.
 - Component types and external types are unique.
-- Invalid, missing, late, and ambiguous dependencies produce compile errors.
+- Invalid, missing, ambiguous, and cyclic dependencies produce compile errors.
