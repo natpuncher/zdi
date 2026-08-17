@@ -16,7 +16,7 @@ pub fn build(build_settings: *std.Build) void {
         }),
     });
 
-    const test_step = build_settings.step("test", "Run ZDI tests");
+    const test_step = build_settings.step("test", "Run zdi tests");
     const run_tests = build_settings.addRunArtifact(tests);
     test_step.dependOn(&run_tests.step);
 }
