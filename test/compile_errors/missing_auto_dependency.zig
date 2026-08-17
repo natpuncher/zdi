@@ -7,5 +7,5 @@ const Consumer = struct {
 };
 
 test {
-    _ = try zdi.init(std.testing.allocator, struct { consumer: Consumer }, .{});
+    _ = try zdi.init(std.testing.allocator, .{struct { consumer: Consumer }}, .{});
 }

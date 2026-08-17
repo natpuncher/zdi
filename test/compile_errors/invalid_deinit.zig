@@ -6,6 +6,6 @@ const Service = struct {
 };
 
 test {
-    const container = try zdi.init(std.testing.allocator, struct { service: Service }, .{});
-    zdi.deinit(std.testing.allocator, container);
+    const registry = try zdi.init(std.testing.allocator, .{struct { service: Service }}, .{});
+    zdi.deinit(registry);
 }

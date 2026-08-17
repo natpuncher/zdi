@@ -9,8 +9,8 @@ const Consumer = struct {
 };
 
 test {
-    _ = try zdi.init(std.testing.allocator, struct {
+    _ = try zdi.init(std.testing.allocator, .{struct {
         item: Item,
         consumer: Consumer,
-    }, .{});
+    }}, .{});
 }

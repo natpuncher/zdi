@@ -434,6 +434,16 @@ fn validateConfig(config: anytype) void {
         }
     }
     if (comptime @hasField(@TypeOf(config), "externals")) validateExternals(@TypeOf(config.externals));
+    if (comptime @hasField(@TypeOf(config), "observer")) validateObserver(@TypeOf(config.observer));
+}
+
+fn validateObserver(comptime observer_type: type) void {
+    if (@typeInfo(observer_type) != .@"struct" or
+        !@hasField(observer_type, "context") or
+        !@hasField(observer_type, "callback"))
+    {
+        @compileError("zdi config observer must contain 'context' and 'callback' fields");
+    }
 }
 
 fn validateExternals(comptime externals_type: type) void {

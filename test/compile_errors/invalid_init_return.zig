@@ -8,5 +8,5 @@ const Service = struct {
 };
 
 test {
-    _ = try zdi.init(std.testing.allocator, struct { service: Service }, .{});
+    _ = try zdi.init(std.testing.allocator, .{struct { service: Service }}, .{});
 }

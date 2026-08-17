@@ -48,7 +48,7 @@ pub fn build(build_settings: *std.Build) void {
         build_settings,
         test_step,
         "test/compile_errors/invalid_observer.zig",
-        "zdi observer must be a function with signature",
+        "zdi config observer must contain 'context' and 'callback' fields",
     );
     addCompileErrorTest(
         build_settings,

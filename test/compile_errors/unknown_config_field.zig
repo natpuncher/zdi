@@ -2,5 +2,5 @@ const std = @import("std");
 const zdi = @import("zdi");
 
 test {
-    _ = try zdi.init(std.testing.allocator, struct {}, .{ .external = .{} });
+    _ = try zdi.init(std.testing.allocator, .{struct {}}, .{ .external = .{} });
 }
