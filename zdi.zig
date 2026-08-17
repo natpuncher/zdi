@@ -1,77 +1,126 @@
 const std = @import("std");
 
-pub fn init(
-    allocator: std.mem.Allocator,
-    comptime container_type: type,
-    config: anytype,
-) !*container_type {
-    @setEvalBranchQuota(10_000);
-    validateContainerType(container_type);
-    validateConfig(container_type, config);
+pub fn Registry(comptime container_types: anytype) type {
+    const types = validatedContainerTypes(container_types);
+    const Containers = std.meta.Tuple(&types);
 
-    const fields = @typeInfo(container_type).@"struct".fields;
-    validateContainerFields(fields);
-    const init_order = comptime initializationOrder(container_type);
+    return struct {
+        const Self = @This();
 
-    const container = try allocator.create(container_type);
-    errdefer allocator.destroy(container);
+        pub const zdi_container_types = container_types;
 
-    var initialized_count: usize = 0;
-    errdefer internalDeinit(container, init_order, initialized_count);
+        allocator: std.mem.Allocator,
+        containers: Containers,
 
-    inline for (init_order, 0..) |field_index, init_index| {
-        const field = fields[field_index];
-        if (field.type == std.mem.Allocator) {
-            @compileError(
-                "zdi container field '" ++ field.name ++
-                    "' must not store std.mem.Allocator; request it as an init parameter",
-            );
-        }
-
-        if (comptime hasDecl(field.type, "init")) {
-            validateInit(field.type, field.name);
-            const args = createArgs(
-                initArgsType(field.type),
-                container,
-                allocator,
-                fields,
-                field.name,
-                config,
-            );
-            const value = @call(.auto, @field(field.type, "init"), args);
-            switch (@typeInfo(@TypeOf(value))) {
-                .error_union => @field(container, field.name) = try value,
-                else => @field(container, field.name) = value,
+        pub fn get(self: *Self, comptime container_type: type) *container_type {
+            inline for (container_types, 0..) |registered_type, container_index| {
+                if (registered_type == container_type) return &self.containers[container_index];
             }
-        } else {
-            @field(container, field.name) = createInstance(
-                field,
-                container,
-                allocator,
-                fields,
-                config,
+            @compileError(
+                "zdi container type '" ++ @typeName(container_type) ++ "' is not registered",
             );
         }
-
-        initialized_count = init_index + 1;
-        observeInit(config, container, field.name);
-    }
-
-    return container;
+    };
 }
 
-pub fn deinit(allocator: std.mem.Allocator, container: anytype) void {
-    const container_type = @TypeOf(container.*);
-    const init_order = comptime initializationOrder(container_type);
-    internalDeinit(container, init_order, init_order.len);
-    allocator.destroy(container);
+pub fn init(
+    allocator: std.mem.Allocator,
+    comptime container_types: anytype,
+    config: anytype,
+) !*Registry(container_types) {
+    const component_count = comptime componentCount(container_types);
+    @setEvalBranchQuota(component_count * component_count * component_count * 2);
+
+    validateConfig(config);
+    validateComponents(container_types);
+
+    const RegistryType = Registry(container_types);
+    const init_order = comptime initializationOrder(container_types);
+
+    const registry = try allocator.create(RegistryType);
+    registry.allocator = allocator;
+    errdefer allocator.destroy(registry);
+
+    var initialized_count: usize = 0;
+    errdefer internalDeinit(registry, container_types, init_order, initialized_count);
+
+    inline for (init_order, 0..) |component_index, init_index| {
+        try initializeComponent(registry, container_types, component_index, config);
+        initialized_count = init_index + 1;
+    }
+
+    comptime std.debug.assert(component_count == init_order.len);
+    return registry;
+}
+
+pub fn deinit(registry: anytype) void {
+    const RegistryType = @TypeOf(registry.*);
+    const container_types = RegistryType.zdi_container_types;
+    const component_count = comptime componentCount(container_types);
+    @setEvalBranchQuota(component_count * component_count * component_count * 2);
+
+    const init_order = comptime initializationOrder(container_types);
+    const allocator = registry.allocator;
+    internalDeinit(registry, container_types, init_order, init_order.len);
+    allocator.destroy(registry);
+}
+
+fn initializeComponent(
+    registry: anytype,
+    comptime container_types: anytype,
+    comptime target_index: usize,
+    config: anytype,
+) !void {
+    comptime var component_index: usize = 0;
+    inline for (container_types, 0..) |container_type, container_index| {
+        const fields = @typeInfo(container_type).@"struct".fields;
+        inline for (fields) |field| {
+            if (component_index == target_index) {
+                if (field.type == std.mem.Allocator) {
+                    @compileError(
+                        "zdi container field '" ++ field.name ++
+                            "' must not store std.mem.Allocator; request it as an init parameter",
+                    );
+                }
+
+                const container = &registry.containers[container_index];
+                if (comptime hasDecl(field.type, "init")) {
+                    validateInit(field.type, componentPath(container_type, field.name));
+                    const args = createArgs(
+                        initArgsType(field.type),
+                        registry,
+                        container_types,
+                        componentPath(container_type, field.name),
+                        config,
+                    );
+                    const value = @call(.auto, @field(field.type, "init"), args);
+                    switch (@typeInfo(@TypeOf(value))) {
+                        .error_union => @field(container, field.name) = try value,
+                        else => @field(container, field.name) = value,
+                    }
+                } else {
+                    @field(container, field.name) = createInstance(
+                        field,
+                        registry,
+                        container_types,
+                        componentPath(container_type, field.name),
+                        config,
+                    );
+                }
+                observeInit(config, container, field.name);
+                return;
+            }
+            component_index += 1;
+        }
+    }
+    unreachable;
 }
 
 fn createInstance(
     comptime container_field: anytype,
-    container: anytype,
-    allocator: std.mem.Allocator,
-    comptime container_fields: anytype,
+    registry: anytype,
+    comptime container_types: anytype,
+    comptime consumer_name: []const u8,
     config: anytype,
 ) container_field.type {
     const component_type = container_field.type;
@@ -82,7 +131,7 @@ fn createInstance(
     if (component_type == void) return {};
     if (@typeInfo(component_type) != .@"struct") {
         @compileError(
-            "zdi field '" ++ container_field.name ++ "' of type '" ++
+            "zdi field '" ++ consumer_name ++ "' of type '" ++
                 @typeName(component_type) ++ "' has no init and no default value",
         );
     }
@@ -92,16 +141,12 @@ fn createInstance(
         if (field.default_value_ptr) |default_value_ptr| {
             @field(result, field.name) = readDefault(field.type, default_value_ptr);
         } else {
-            const consumer_name = std.fmt.comptimePrint(
-                "{s}.{s}",
-                .{ container_field.name, field.name },
-            );
+            const field_name = std.fmt.comptimePrint("{s}.{s}", .{ consumer_name, field.name });
             @field(result, field.name) = resolve(
-                container,
+                registry,
                 field.type,
-                allocator,
-                container_fields,
-                consumer_name,
+                container_types,
+                field_name,
                 config,
             );
         }
@@ -120,9 +165,8 @@ fn initArgsType(comptime field_type: type) type {
 
 fn createArgs(
     comptime args_type: type,
-    container: anytype,
-    allocator: std.mem.Allocator,
-    comptime container_fields: anytype,
+    registry: anytype,
+    comptime container_types: anytype,
     comptime consumer_name: []const u8,
     config: anytype,
 ) args_type {
@@ -133,10 +177,9 @@ fn createArgs(
         .@"struct" => |struct_info| {
             inline for (struct_info.fields) |field| {
                 @field(result, field.name) = resolve(
-                    container,
+                    registry,
                     field.type,
-                    allocator,
-                    container_fields,
+                    container_types,
                     consumer_name,
                     config,
                 );
@@ -149,16 +192,13 @@ fn createArgs(
 }
 
 fn resolve(
-    container: anytype,
+    registry: anytype,
     comptime dependency_type: type,
-    allocator: std.mem.Allocator,
-    comptime container_fields: anytype,
+    comptime container_types: anytype,
     comptime consumer_name: []const u8,
     config: anytype,
 ) dependency_type {
-    if (dependency_type == std.mem.Allocator) {
-        return allocator;
-    }
+    if (dependency_type == std.mem.Allocator) return registry.allocator;
 
     if (comptime @hasField(@TypeOf(config), "externals")) {
         const externals = config.externals;
@@ -170,14 +210,12 @@ fn resolve(
                 if (external_match != null) {
                     @compileError(
                         "zdi external dependency '" ++ @typeName(dependency_type) ++
-                            "' for field '" ++ consumer_name ++
-                            "' is ambiguous",
+                            "' for field '" ++ consumer_name ++ "' is ambiguous",
                     );
                 }
                 external_match = field_index;
             }
         }
-
         if (external_match) |field_index| {
             return @field(externals, external_fields[field_index].name);
         }
@@ -193,23 +231,8 @@ fn resolve(
             );
         }
         const pointee_type = dependency_info.pointer.child;
-        comptime var match_index: ?usize = null;
-
-        inline for (container_fields, 0..) |field, field_index| {
-            if (field.type == pointee_type) {
-                if (match_index != null) {
-                    @compileError(
-                        "zdi dependency '" ++ @typeName(dependency_type) ++
-                            "' for field '" ++ consumer_name ++
-                            "' is ambiguous",
-                    );
-                }
-                match_index = field_index;
-            }
-        }
-
-        if (match_index) |field_index| {
-            return &@field(container, container_fields[field_index].name);
+        if (comptime componentDependencyIndex(container_types, dependency_type) != null) {
+            return componentPointer(registry, container_types, pointee_type);
         }
     }
 
@@ -219,76 +242,107 @@ fn resolve(
     );
 }
 
-fn initializationOrder(
-    comptime container_type: type,
-) [@typeInfo(container_type).@"struct".fields.len]usize {
-    const fields = @typeInfo(container_type).@"struct".fields;
-    var order: [fields.len]usize = undefined;
-    var initialized: [fields.len]bool = .{false} ** fields.len;
+fn componentPointer(
+    registry: anytype,
+    comptime container_types: anytype,
+    comptime component_type: type,
+) *component_type {
+    inline for (container_types, 0..) |container_type, container_index| {
+        inline for (@typeInfo(container_type).@"struct".fields) |field| {
+            if (field.type == component_type) {
+                return &@field(registry.containers[container_index], field.name);
+            }
+        }
+    }
+    unreachable;
+}
 
-    for (0..fields.len) |init_index| {
+fn initializationOrder(comptime container_types: anytype) [componentCount(container_types)]usize {
+    const count = componentCount(container_types);
+    var order: [count]usize = undefined;
+    var initialized: [count]bool = .{false} ** count;
+
+    for (0..count) |init_index| {
         var selected: ?usize = null;
-        for (fields, 0..) |field, field_index| {
-            if (!initialized[field_index] and dependenciesReady(field, fields, initialized)) {
-                selected = field_index;
+        for (0..count) |component_index| {
+            if (!initialized[component_index] and
+                dependenciesReady(container_types, component_index, initialized))
+            {
+                selected = component_index;
                 break;
             }
         }
 
-        const field_index = selected orelse dependencyCycle(fields, initialized);
-        order[init_index] = field_index;
-        initialized[field_index] = true;
+        const component_index = selected orelse dependencyCycle(container_types, initialized);
+        order[init_index] = component_index;
+        initialized[component_index] = true;
     }
-
     return order;
 }
 
-fn dependenciesReady(comptime component: anytype, comptime fields: anytype, initialized: anytype) bool {
-    if (component.default_value_ptr != null or component.type == void) return true;
+fn dependenciesReady(
+    comptime container_types: anytype,
+    comptime target_index: usize,
+    initialized: anytype,
+) bool {
+    comptime var component_index: usize = 0;
+    inline for (container_types) |container_type| {
+        inline for (@typeInfo(container_type).@"struct".fields) |component| {
+            if (component_index == target_index) {
+                if (component.default_value_ptr != null or component.type == void) return true;
 
-    if (hasDecl(component.type, "init")) {
-        validateInit(component.type, component.name);
-        const function = @typeInfo(@TypeOf(@field(component.type, "init"))).@"fn";
-        for (function.params) |parameter| {
-            const dependency_type = parameter.type orelse return false;
-            if (containerDependencyIndex(fields, dependency_type)) |dependency_index| {
-                if (!initialized[dependency_index]) return false;
+                if (hasDecl(component.type, "init")) {
+                    validateInit(component.type, componentPath(container_type, component.name));
+                    const function = @typeInfo(@TypeOf(@field(component.type, "init"))).@"fn";
+                    for (function.params) |parameter| {
+                        const dependency_type = parameter.type orelse return false;
+                        if (componentDependencyIndex(container_types, dependency_type)) |dependency_index| {
+                            if (!initialized[dependency_index]) return false;
+                        }
+                    }
+                    return true;
+                }
+
+                const component_info = @typeInfo(component.type);
+                if (component_info != .@"struct") return true;
+                for (component_info.@"struct".fields) |field| {
+                    if (field.default_value_ptr != null) continue;
+                    if (componentDependencyIndex(container_types, field.type)) |dependency_index| {
+                        if (!initialized[dependency_index]) return false;
+                    }
+                }
+                return true;
             }
-        }
-        return true;
-    }
-
-    const component_info = @typeInfo(component.type);
-    if (component_info != .@"struct") return true;
-    for (component_info.@"struct".fields) |field| {
-        if (field.default_value_ptr != null) continue;
-        if (containerDependencyIndex(fields, field.type)) |dependency_index| {
-            if (!initialized[dependency_index]) return false;
+            component_index += 1;
         }
     }
-    return true;
+    unreachable;
 }
 
-fn containerDependencyIndex(comptime fields: anytype, comptime dependency_type: type) ?usize {
+fn componentDependencyIndex(comptime container_types: anytype, comptime dependency_type: type) ?usize {
     if (dependency_type == std.mem.Allocator) return null;
-
     const dependency_info = @typeInfo(dependency_type);
     if (dependency_info != .pointer or dependency_info.pointer.size != .one) return null;
 
-    for (fields, 0..) |field, field_index| {
-        if (field.type == dependency_info.pointer.child) return field_index;
+    comptime var component_index: usize = 0;
+    inline for (container_types) |container_type| {
+        inline for (@typeInfo(container_type).@"struct".fields) |field| {
+            if (field.type == dependency_info.pointer.child) return component_index;
+            component_index += 1;
+        }
     }
     return null;
 }
 
-fn dependencyCycle(comptime fields: anytype, initialized: anytype) noreturn {
+fn dependencyCycle(comptime container_types: anytype, initialized: anytype) noreturn {
     comptime var message: []const u8 = "zdi dependency cycle between fields";
-    comptime var first = true;
-    for (fields, 0..) |field, field_index| {
-        if (!initialized[field_index]) {
-            message = message ++ if (first) " '" else ", '";
-            message = message ++ field.name ++ "'";
-            first = false;
+    comptime var component_index: usize = 0;
+    inline for (container_types) |container_type| {
+        inline for (@typeInfo(container_type).@"struct".fields) |field| {
+            if (!initialized[component_index]) {
+                message = message ++ " '" ++ componentPath(container_type, field.name) ++ "'";
+            }
+            component_index += 1;
         }
     }
     @compileError(message);
@@ -300,34 +354,76 @@ fn observeInit(config: anytype, container: anytype, comptime field_name: []const
     }
 }
 
-fn internalDeinit(container: anytype, comptime init_order: anytype, initialized_count: usize) void {
-    const fields = @typeInfo(@TypeOf(container.*)).@"struct".fields;
-
+fn internalDeinit(
+    registry: anytype,
+    comptime container_types: anytype,
+    comptime init_order: anytype,
+    initialized_count: usize,
+) void {
     inline for (init_order, 0..) |_, reverse_offset| {
         const init_index = init_order.len - 1 - reverse_offset;
-        const field_index = init_order[init_index];
-        const field = fields[field_index];
-
-        if (initialized_count > init_index and comptime hasDecl(field.type, "deinit")) {
-            @call(.auto, @field(field.type, "deinit"), .{&@field(container, field.name)});
+        if (initialized_count > init_index) {
+            deinitComponent(registry, container_types, init_order[init_index]);
         }
     }
 }
 
-fn validateContainerType(comptime container_type: type) void {
-    if (@typeInfo(container_type) != .@"struct") {
-        @compileError(
-            "zdi container type must be a struct, found '" ++
-                @typeName(container_type) ++ "'",
-        );
+fn deinitComponent(registry: anytype, comptime container_types: anytype, comptime target_index: usize) void {
+    comptime var component_index: usize = 0;
+    inline for (container_types, 0..) |container_type, container_index| {
+        inline for (@typeInfo(container_type).@"struct".fields) |field| {
+            if (component_index == target_index) {
+                if (comptime hasDecl(field.type, "deinit")) {
+                    const component = &@field(registry.containers[container_index], field.name);
+                    @call(.auto, @field(field.type, "deinit"), .{component});
+                }
+                return;
+            }
+            component_index += 1;
+        }
     }
+    unreachable;
 }
 
-fn validateConfig(comptime container_type: type, config: anytype) void {
-    const config_info = @typeInfo(@TypeOf(config));
-    if (config_info != .@"struct") {
-        @compileError("zdi config must be a struct");
+fn validatedContainerTypes(comptime container_types: anytype) [container_types.len]type {
+    const info = @typeInfo(@TypeOf(container_types));
+    if (info != .@"struct" or !info.@"struct".is_tuple) {
+        @compileError("zdi containers must be a tuple of struct types");
     }
+    if (container_types.len == 0) {
+        @compileError("zdi requires at least one container type");
+    }
+
+    var result: [container_types.len]type = undefined;
+    inline for (container_types, 0..) |container_type, container_index| {
+        if (@TypeOf(container_type) != type or @typeInfo(container_type) != .@"struct") {
+            @compileError("zdi containers must be a tuple of struct types");
+        }
+        inline for (container_types, 0..) |other_type, other_index| {
+            if (other_index > container_index and container_type == other_type) {
+                @compileError("zdi container type '" ++ @typeName(container_type) ++ "' is duplicated");
+            }
+        }
+        result[container_index] = container_type;
+    }
+    return result;
+}
+
+fn componentCount(comptime container_types: anytype) usize {
+    var count = 0;
+    inline for (container_types) |container_type| {
+        count += @typeInfo(container_type).@"struct".fields.len;
+    }
+    return count;
+}
+
+fn componentPath(comptime container_type: type, comptime field_name: []const u8) []const u8 {
+    return @typeName(container_type) ++ "." ++ field_name;
+}
+
+fn validateConfig(config: anytype) void {
+    const config_info = @typeInfo(@TypeOf(config));
+    if (config_info != .@"struct") @compileError("zdi config must be a struct");
 
     inline for (config_info.@"struct".fields) |field| {
         if (comptime !std.mem.eql(u8, field.name, "externals") and
@@ -336,13 +432,7 @@ fn validateConfig(comptime container_type: type, config: anytype) void {
             @compileError("zdi config field '" ++ field.name ++ "' is not supported");
         }
     }
-
-    if (comptime @hasField(@TypeOf(config), "externals")) {
-        validateExternals(@TypeOf(config.externals));
-    }
-    if (comptime @hasField(@TypeOf(config), "observer")) {
-        validateObserver(container_type, @TypeOf(config.observer));
-    }
+    if (comptime @hasField(@TypeOf(config), "externals")) validateExternals(@TypeOf(config.externals));
 }
 
 fn validateExternals(comptime externals_type: type) void {
@@ -353,49 +443,37 @@ fn validateExternals(comptime externals_type: type) void {
 
     const fields = externals_info.@"struct".fields;
     inline for (fields, 0..) |field, field_index| {
-        inline for (fields[field_index + 1 ..]) |other| {
-            if (field.type == other.type) {
-                @compileError(
-                    "zdi external type '" ++ @typeName(field.type) ++ "' is duplicated",
-                );
+        inline for (fields, 0..) |other, other_index| {
+            if (other_index > field_index and field.type == other.type) {
+                @compileError("zdi external type '" ++ @typeName(field.type) ++ "' is duplicated");
             }
         }
     }
 }
 
-fn validateObserver(comptime container_type: type, comptime observer_type: type) void {
-    const observer_info = @typeInfo(observer_type);
-    const expected_message = "zdi observer must be a function with signature 'fn (*" ++
-        @typeName(container_type) ++ ", []const u8) void'";
-
-    if (observer_info != .@"fn") {
-        @compileError(expected_message);
-    }
-
-    const function = observer_info.@"fn";
-    if (function.is_var_args or
-        function.params.len != 2 or
-        function.params[0].type != *container_type or
-        function.params[1].type != []const u8 or
-        function.return_type != void)
-    {
-        @compileError(expected_message);
-    }
-}
-
-fn validateContainerFields(comptime fields: anytype) void {
-    inline for (fields, 0..) |field, field_index| {
-        if (comptime hasDecl(field.type, "deinit")) {
-            validateDeinit(field.type);
+fn validateComponents(comptime container_types: anytype) void {
+    _ = validatedContainerTypes(container_types);
+    inline for (container_types) |container_type| {
+        inline for (@typeInfo(container_type).@"struct".fields) |field| {
+            if (comptime hasDecl(field.type, "deinit")) validateDeinit(field.type);
         }
+    }
 
-        if (comptime !canHaveDecls(field.type)) continue;
-        inline for (fields[field_index + 1 ..]) |other| {
-            if (field.type == other.type) {
-                @compileError(
-                    "zdi component type '" ++ @typeName(field.type) ++ "' is duplicated",
-                );
+    comptime var left_index: usize = 0;
+    inline for (container_types) |container_type| {
+        inline for (@typeInfo(container_type).@"struct".fields) |field| {
+            comptime var right_index: usize = 0;
+            inline for (container_types) |other_container_type| {
+                inline for (@typeInfo(other_container_type).@"struct".fields) |other_field| {
+                    if (right_index > left_index and field.type == other_field.type) {
+                        @compileError(
+                            "zdi component type '" ++ @typeName(field.type) ++ "' is duplicated",
+                        );
+                    }
+                    right_index += 1;
+                }
             }
+            left_index += 1;
         }
     }
 }
@@ -403,11 +481,8 @@ fn validateContainerFields(comptime fields: anytype) void {
 fn validateInit(comptime field_type: type, comptime field_name: []const u8) void {
     const function = @typeInfo(@TypeOf(@field(field_type, "init"))).@"fn";
     if (function.is_generic or function.is_var_args) {
-        @compileError(
-            "zdi init for field '" ++ field_name ++ "' cannot be generic or variadic",
-        );
+        @compileError("zdi init for field '" ++ field_name ++ "' cannot be generic or variadic");
     }
-
     const return_type = function.return_type orelse @compileError(
         "zdi init for field '" ++ field_name ++ "' must declare a return type",
     );
@@ -428,17 +503,11 @@ fn validateDeinit(comptime field_type: type) void {
     const function_info = @typeInfo(@TypeOf(@field(field_type, "deinit")));
     const expected_message = "zdi deinit for type '" ++ @typeName(field_type) ++
         "' must have signature 'fn (*" ++ @typeName(field_type) ++ ") void'";
-
-    if (function_info != .@"fn") {
-        @compileError(expected_message);
-    }
+    if (function_info != .@"fn") @compileError(expected_message);
 
     const function = function_info.@"fn";
-    if (function.is_generic or
-        function.is_var_args or
-        function.params.len != 1 or
-        function.params[0].type != *field_type or
-        function.return_type != void)
+    if (function.is_generic or function.is_var_args or function.params.len != 1 or
+        function.params[0].type != *field_type or function.return_type != void)
     {
         @compileError(expected_message);
     }
@@ -447,13 +516,6 @@ fn validateDeinit(comptime field_type: type) void {
 fn hasDecl(comptime value_type: type, comptime name: []const u8) bool {
     return switch (@typeInfo(value_type)) {
         .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(value_type, name),
-        else => false,
-    };
-}
-
-fn canHaveDecls(comptime value_type: type) bool {
-    return switch (@typeInfo(value_type)) {
-        .@"struct", .@"enum", .@"union", .@"opaque" => true,
         else => false,
     };
 }

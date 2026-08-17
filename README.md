@@ -1,8 +1,9 @@
 # zdi
 
-Small compile-time dependency injection container for Zig. zdi derives
-initialization order from dependencies at compile time. Types may provide
-`init` or let zdi assemble their fields automatically.
+Small compile-time dependency injection registry for Zig. Register one or more
+container structs and zdi derives a global initialization order from their
+dependencies at compile time. Types may provide `init` or let zdi assemble
+their fields automatically.
 
 ## Example
 
@@ -65,20 +66,21 @@ const Game = struct {
     running: bool = true,
 };
 
+// UI lives in a separate container but shares the same dependency graph.
+const InventoryWindow = struct {
+    game: *Game,
+};
+
 // Declaration order is arbitrary; zdi derives Logger -> Assets -> Audio -> Game.
 const Container = struct {
     game: Game,
     audio: Audio,
     logger: Logger,
     assets: Assets,
+};
 
-    // Called after every successfully initialized container field.
-    pub fn observeInit(
-        _: *Container,
-        comptime field_name: []const u8,
-    ) void {
-        std.debug.print("initialized: {s}\n", .{field_name});
-    }
+const UiContainer = struct {
+    inventory: InventoryWindow,
 };
 
 pub fn main() !void {
@@ -88,19 +90,23 @@ pub fn main() !void {
         .volume = 80,
     };
 
-    const container = try zdi.init(allocator, Container, .{
+    const containers = try zdi.init(allocator, .{ Container, UiContainer }, .{
         .externals = .{runtime},
-        .observer = Container.observeInit,
     });
 
-    // Reverse-order component cleanup, then container destruction.
-    defer zdi.deinit(allocator, container);
+    // Reverse-order component cleanup, then registry destruction with the
+    // allocator captured by init.
+    defer zdi.deinit(containers);
+
+    const container = containers.get(Container);
+    const ui = containers.get(UiContainer);
 
     std.debug.assert(container.assets.logger == &container.logger);
     std.debug.assert(container.assets.cache_limit == 128);
     std.debug.assert(container.audio.assets == &container.assets);
     std.debug.assert(container.audio.volume == 80);
     std.debug.assert(container.game.audio == &container.audio);
+    std.debug.assert(ui.inventory.game == &container.game);
     std.debug.assert(container.game.running);
 }
 ```
@@ -110,10 +116,14 @@ reverse dependency order.
 
 ## Compile-time contract
 
+- `init` accepts a tuple containing one or more unique container struct types.
+- `get(ContainerType)` returns the registered container by type.
 - Config accepts optional `externals` and `observer` fields.
 - Externals are resolved by exact type before container dependencies.
-- Container dependencies use single-item pointers.
+- Container dependencies use single-item pointers and resolve across every
+  registered container.
 - A component `init` returns its own type or an error union containing it.
 - Without `init`, required fields are injected and defaults are preserved.
-- Component types and external types are unique.
+- Container, component, and external types are unique in their respective
+  registries.
 - Invalid, missing, ambiguous, and cyclic dependencies produce compile errors.
