@@ -350,7 +350,8 @@ fn dependencyCycle(comptime container_types: anytype, initialized: anytype) nore
 
 fn observeInit(config: anytype, container: anytype, comptime field_name: []const u8) void {
     if (comptime @hasField(@TypeOf(config), "observer")) {
-        @call(.auto, config.observer, .{ container, field_name });
+        const observer = config.observer;
+        @call(.auto, observer.callback, .{ observer.context, container, field_name });
     }
 }
 
